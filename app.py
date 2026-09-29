@@ -624,11 +624,11 @@ with st.sidebar:
         import json
         st.info("Fetching latest alerts from Wazuh Indexer...")
         try:
-            # Query the Wazuh Indexer (Opensearch) for the latest 20 alerts
+            # Query the Wazuh Indexer (Opensearch) for the latest 5 alerts to save LLM tokens
             query = {
                 "query": {"match_all": {}},
                 "sort": [{"timestamp": {"order": "desc"}}],
-                "size": 20
+                "size": 5
             }
             response = requests.post(
                 f"{wazuh_url.rstrip('/')}/wazuh-alerts-*/_search",
@@ -645,9 +645,18 @@ with st.sidebar:
                     fetched_logs = ""
                     for hit in hits:
                         source = hit.get("_source", {})
-                        fetched_logs += json.dumps(source) + "\n"
+                        # Compress alert to essential fields only to avoid LLM token limits (Error 413)
+                        essential_alert = {
+                            "timestamp": source.get("timestamp"),
+                            "rule_level": source.get("rule", {}).get("level"),
+                            "rule_desc": source.get("rule", {}).get("description"),
+                            "agent": source.get("agent", {}).get("name"),
+                            "full_log": source.get("full_log"),
+                            "data": source.get("data", {})
+                        }
+                        fetched_logs += json.dumps(essential_alert) + "\n"
                     st.session_state.raw_logs_input = fetched_logs
-                    st.success(f"✅ Successfully fetched {len(hits)} live alerts! Click 'Investigate' to analyze them.")
+                    st.success(f"✅ Successfully fetched {len(hits)} compressed live alerts! Click 'Investigate' to analyze them.")
                     st.rerun()
                 else:
                     st.warning("Connected successfully, but no recent alerts found.")
