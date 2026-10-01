@@ -611,59 +611,100 @@ with st.sidebar:
                                   placeholder="Paste any log format here...\nWindows Event / Sysmon / Firewall / Auth...")
 
     st.markdown('<hr style="border:none;border-top:1px solid #162035;margin:14px 0;">', unsafe_allow_html=True)
-    st.markdown('<div style="font-size:10px;font-weight:700;color:#5a6a80;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px;">Live Wazuh Integration</div>', unsafe_allow_html=True)
-    
-    wazuh_url = st.text_input("Wazuh Indexer URL", value="https://127.0.0.1:9200", help="Port 9200 is used for Wazuh Indexer (Opensearch) where alerts are stored.")
-    wazuh_user = st.text_input("Wazuh User", value="admin")
-    wazuh_pass = st.text_input("Wazuh Password", type="password")
-    
+    st.markdown('<div style="font-size:10px;font-weight:700;color:#5a6a80;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px;">Live Wazuh Integration (via FastAPI)</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-size:10px;color:#3b7dd8;margin-bottom:8px;">Connect to your backend API — NOT Wazuh directly.</div>', unsafe_allow_html=True)
+
+    # Try to load from Streamlit secrets first, fallback to manual input
+    try:
+        import streamlit as _st
+        default_api_url = _st.secrets.get("API_BASE_URL", "")
+        default_api_key = _st.secrets.get("API_SECRET_KEY", "")
+    except Exception:
+        default_api_url = ""
+        default_api_key = ""
+
+    backend_url = st.text_input(
+        "Backend API URL (Cloudflare Tunnel)",
+        value=default_api_url,
+        placeholder="https://abc-xyz.trycloudflare.com",
+        help="This is your FastAPI backend running on port 8000, exposed via Cloudflare tunnel."
+    )
+    backend_key = st.text_input(
+        "API Secret Key",
+        value=default_api_key,
+        type="password",
+        help="The API_SECRET_KEY you set in your .env file on Debian."
+    )
+
     fetch_wazuh_btn = st.button("🔄 Fetch Live Wazuh Logs", use_container_width=True)
 
     if fetch_wazuh_btn:
-        import requests
-        import json
-        st.info("Fetching latest alerts from Wazuh Indexer...")
-        try:
-            # Query the Wazuh Indexer (Opensearch) for the latest 5 alerts to save LLM tokens
-            query = {
-                "query": {"match_all": {}},
-                "sort": [{"timestamp": {"order": "desc"}}],
-                "size": 5
-            }
-            response = requests.post(
-                f"{wazuh_url.rstrip('/')}/wazuh-alerts-*/_search",
-                auth=(wazuh_user, wazuh_pass),
-                json=query,
-                verify=False, # Ignore self-signed certs for local Wazuh
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                hits = data.get("hits", {}).get("hits", [])
-                if hits:
-                    fetched_logs = ""
-                    for hit in hits:
-                        source = hit.get("_source", {})
-                        # Compress alert to essential fields only to avoid LLM token limits (Error 413)
-                        essential_alert = {
-                            "timestamp": source.get("timestamp"),
-                            "rule_level": source.get("rule", {}).get("level"),
-                            "rule_desc": source.get("rule", {}).get("description"),
-                            "agent": source.get("agent", {}).get("name"),
-                            "full_log": source.get("full_log"),
-                            "data": source.get("data", {})
-                        }
-                        fetched_logs += json.dumps(essential_alert) + "\n"
-                    st.session_state.raw_logs_input = fetched_logs
-                    st.success(f"✅ Successfully fetched {len(hits)} compressed live alerts! Click 'Investigate' to analyze them.")
-                    st.rerun()
-                else:
-                    st.warning("Connected successfully, but no recent alerts found.")
-            else:
-                st.error(f"Failed to fetch logs. Status Code: {response.status_code}\nDetails: {response.text}")
-        except Exception as e:
-            st.error(f"Connection Error: {str(e)}")
+        import requests as _req
+        import json as _json
+
+        if not backend_url:
+            st.error("Please enter your Backend API URL (Cloudflare tunnel URL).")
+        elif not backend_key:
+            st.error("Please enter your API Secret Key.")
+        else:
+            base = backend_url.rstrip("/")
+            headers = {"x-api-key": backend_key}
+
+            # Step 1: Trigger ingestion (fetch from Wazuh and store in DB)
+            with st.spinner("Fetching latest alerts from Wazuh via FastAPI backend..."):
+                try:
+                    ingest_resp = _req.post(
+                        f"{base}/fetch-and-store",
+                        headers=headers,
+                        timeout=30,
+                        verify=False
+                    )
+                    if ingest_resp.status_code == 200:
+                        result = ingest_resp.json()
+                        saved    = result.get("saved", 0)
+                        fetched  = result.get("fetched", 0)
+                        skipped  = result.get("skipped_duplicates", 0)
+                        st.success(f"✅ Ingestion done! Fetched: {fetched} | Saved new: {saved} | Duplicates skipped: {skipped}")
+                    elif ingest_resp.status_code == 401:
+                        st.error("❌ Invalid API Key. Check your API_SECRET_KEY.")
+                        st.stop()
+                    else:
+                        st.warning(f"Ingestion returned status {ingest_resp.status_code}: {ingest_resp.text[:300]}")
+                except Exception as e:
+                    st.error(f"❌ Cannot reach backend: {str(e)}\n\nMake sure:\n1. FastAPI is running on Debian (port 8000)\n2. Cloudflare tunnel is running for port 8000\n3. Tunnel URL is correct and NOT port 9200")
+                    st.stop()
+
+            # Step 2: Fetch incidents from DB for Streamlit to display
+            try:
+                inc_resp = _req.get(
+                    f"{base}/incidents",
+                    headers=headers,
+                    timeout=15,
+                    verify=False
+                )
+                if inc_resp.status_code == 200:
+                    incidents = inc_resp.json().get("incidents", [])
+                    if incidents:
+                        # Convert incidents to log-like text for the investigator pipeline
+                        log_lines = []
+                        for inc in incidents[:5]:  # Limit to 5 for LLM token budget
+                            log_lines.append(
+                                f"{inc.get('first_seen','?')} severity={inc.get('severity','?')} "
+                                f"rule_desc=\"{inc.get('title','?')}\" "
+                                f"source_ip={inc.get('source_ip','?')} "
+                                f"agent={inc.get('agent_name','?')} "
+                                f"alert_count={inc.get('alert_count',1)}"
+                            )
+                        st.session_state.raw_logs_input = "\n".join(log_lines)
+                        st.session_state["backend_url"] = base
+                        st.session_state["backend_key"] = headers
+                        st.session_state["live_incidents"] = incidents
+                        st.success(f"✅ Loaded {len(incidents)} incident(s) from database. Click '🔍 Investigate' to analyze.")
+                        st.rerun()
+                    else:
+                        st.warning("No incidents in database yet. Make sure Wazuh is generating alerts.")
+            except Exception as e:
+                st.error(f"Could not fetch incidents: {str(e)}")
 
     st.markdown('<hr style="border:none;border-top:1px solid #162035;margin:14px 0;">', unsafe_allow_html=True)
     c1, c2 = st.columns(2)
